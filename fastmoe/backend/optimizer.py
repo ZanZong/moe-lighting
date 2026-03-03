@@ -11,6 +11,19 @@ MB = 1 << 20
 GB = 1 << 30
 T = 1e12
 
+
+def analyze_long_context_offloading(model_config: ModelConfig,
+                                    hardware_config: HardwareConfig,
+                                    context_lengths=None,
+                                    batch_size: int = 1) -> list:
+    """Analyse when CPU offloading remains beneficial as context grows.
+
+    Delegates to :func:`fastmoe.backend.long_context_policy.analyze_long_context_offloading`.
+    Exposed here for callers that already import from :mod:`fastmoe.backend.optimizer`.
+    """
+    from fastmoe.backend.long_context_policy import analyze_long_context_offloading as _impl
+    return _impl(model_config, hardware_config, context_lengths, batch_size)
+
 def solve_lp(config, bls, gbs, verbose=1, stage="decode"):
     assert bls > 0 and gbs > 0
     assert bls >= gbs and bls % gbs == 0

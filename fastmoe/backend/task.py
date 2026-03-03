@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -13,7 +13,8 @@ class FinishReason(Enum):
     STOP_STR = auto()
 
 class Req:
-    def __init__(self, rid, input_text, input_ids):
+    def __init__(self, rid, input_text, input_ids,
+                 session_id=None, turn_id=0, cached_prefix_len=0):
         self.rid = rid
         self.input_text = input_text
         self.input_ids = input_ids
@@ -32,6 +33,15 @@ class Req:
 
         self.logprob = None
         self.normalized_logprob = None
+
+        # Multi-turn conversation metadata
+        # session_id: unique identifier for the conversation; None for single-turn requests
+        self.session_id: Optional[str] = session_id
+        # turn_id: zero-based index of this turn within the session
+        self.turn_id: int = turn_id
+        # cached_prefix_len: number of tokens already cached from previous turns
+        # that do not need to be re-computed during prefill
+        self.cached_prefix_len: int = cached_prefix_len
 
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
