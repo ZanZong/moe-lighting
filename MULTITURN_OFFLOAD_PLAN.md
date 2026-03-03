@@ -14,7 +14,7 @@
 |-------------------|------------------------------------------------------------------------|---------------|
 | arXiv:2309.06180  | *Efficient Memory Management for LLM Serving with PagedAttention* (vLLM) | SOSP 2023     |
 | arXiv:2312.11514  | *LLM in a Flash: Efficient LLM Inference with Limited Memory* (Apple)  | ICLR 2024     |
-| arXiv:2402.04252  | *KVSharer / InfLLM 附近的工作*（具体ID对应论文见下方分析）              | arXiv 2024    |
+| arXiv:2402.04252  | *InfLLM: Unlocking Long-context Inference via Unforgettable Short-context* (推测，见§1.1)   | arXiv 2024    |
 | KV cache offload search | FlexGen, H2O, SnapKV, KIVI, Quest, Mooncake, CacheGen, StreamingLLM | Various       |
 | CPU+MoE search    | Pre-gated MoE, MoE-Lightning, DeepSpeed-MII, ExpertFlow              | Various       |
 | MLSys 2024        | Sarathi-Serve, Splitwise, vAttention, CacheBlend, etc.                | MLSys 2024    |
@@ -163,9 +163,33 @@ T_GPU_FFN = const（与ctx无关）
 ```
 
 **精确突破点**（Mixtral-8x7B on GCP g2-standard-48）：
-- CPU BDW = 76 GB/s, GPU FFN time ≈ 155ms/layer（bs=1）
-- Break-even at ctx ≈ 2,700 tokens
-- 以(200+100)=300 tokens/turn的速度，**第8轮**即突破
+
+在CGOPipe中，真正的瓶颈是**PCIe权重传输时间T_ctog**（非T_GPU_FFN）：
+```
+T_ctog = wc × expert_weight_size / ctog_bdw
+       = 0.94 × (2×h1×h2×3×ne) / 16GB/s
+       = 0.94 × 2.625GB / 16GB/s ≈ 0.154 s/layer  [与README一致]
+
+对比T_GPU_FFN(bs=324) ≈ 8.79ms << T_ctog → GPU计算被PCIe传输完全隐藏
+```
+
+因此，CGOPipe的不变式实际上是 **T_CPU_attn ≤ T_ctog**：
+```
+T_CPU_attn = (bs × ctx × 2 × nkv × hd × 2B) / c_bdw
+           = (bs × ctx × 4096B) / 76GB/s
+
+令 T_CPU_attn = T_ctog = 0.154s → ctx_breakeven = 0.154 × 76GB / (bs × 4096B)
+```
+
+| batch size | break-even ctx | 约多少轮对话 |
+|------------|---------------|------------|
+| bs=1       | ~3.07M tokens  | 10,242轮   |
+| bs=32      | ~96K tokens    | 320轮      |
+| bs=100     | ~30K tokens    | 102轮      |
+| bs=324 (生产) | ~9.5K tokens | **32轮** ← 实际生产问题 |
+
+**结论**: 不变式违反是**并发批量服务**场景的问题（bs≥100+）；单会话（bs=1）几乎不会遇到。  
+以(200+100)=300 tokens/turn的速度，生产配置下约**第32轮**不变式被违反。
 
 **文献对照**:
 - FlexGen: 静态ctx，不会突破
@@ -182,10 +206,19 @@ CPU Memory Budget C_mem:
   Sum must ≤ C_mem × 0.8
 ```
 
-**数字**（Mixtral-8x7B, C_mem=192GB, ctx=16K, bs=100）：
-- Expert weights (全CPU): 84GB
-- KV cache (100 sessions × 16K ctx): 100 × 16384 × 32 × 2×8×128×2B = ~54GB
-- 合计: 138GB ✓ 但随ctx增长，32K时合计 ~192GB → OOM
+**数字**（Mixtral-8x7B, C_mem=192GB, ctx=16K）：
+
+每token KV大小（每层）= 2(K+V) × nkv × hd × 2B = 2 × 8 × 128 × 2 = 4,096 B
+
+| 场景 | Expert (wc=0.94) | KV (per session) | 10 sessions合计 |
+|------|-----------------|-----------------|----------------|
+| ctx=4K  | 79 GB | 0.5 GB | 79 + 5 = 84 GB ✓ |
+| ctx=16K | 79 GB | 2.0 GB | 79 + 20 = 99 GB ✓ |
+| ctx=32K | 79 GB | 4.0 GB | 79 + 40 = 119 GB ✓ |
+| ctx=32K | 79 GB | 4.0 GB | **100 sessions: 79+400=479GB → OOM** |
+
+单session at 16K tokens: 16384 × 4096B × 32 layers = **2GB**  
+100 sessions × 2GB = 200GB, 加上Expert weights 79GB = 279GB >> 192GB → OOM without TASK
 
 **文献对照**:
 - FlexGen: 联合LP规划了weight+KV，但单次请求，无session管理
@@ -351,15 +384,17 @@ def predict_expert_activations(session_id, layer_id, top_k=2):
 ```
 三层KV存储结构（精确attention，无token丢弃）:
 
-Turn N   (current): FP16 on CPU → 100% bandwidth cost
-Turn N-1 (warm):    INT8 on CPU → 50% bandwidth cost
-Turn ≤N-2 (cold):   INT4 on CPU + per-turn page index → 25% bandwidth cost
+Turn N   (current): FP16 on CPU → 每token KV BW = 4,096 B
+Turn N-1 (warm):    INT8 on CPU → 每token KV BW = 2,048 B  (2×节省)
+Turn ≤N-2 (cold):   INT4 on CPU + per-turn page index → 每token KV BW = 1,024 B (4×节省)
 
-CPU Attention Cost:
-  T_CPU = max(
-    Σ_layers attention_flops / cpu_flops,
-    (ctx_N×BW_fp16 + ctx_{N-1}×BW_int8 + ctx_{≤N-2}×BW_int4) / c_bdw
-  )
+定义 BW_fpk = bytes per token per layer under precision k:
+  BW_fp16 = 2(K+V) × nkv × hd × 2B  = 4,096 B/token/layer
+  BW_int8 = 2(K+V) × nkv × hd × 1B  = 2,048 B/token/layer
+  BW_int4 = 2(K+V) × nkv × hd × 0.5B = 1,024 B/token/layer
+
+CPU Attention BW Cost (per decode step, averaged over layers):
+  T_CPU_bw = (ctx_N × BW_fp16 + ctx_{N-1} × BW_int8 + ctx_{≤N-2} × BW_int4) / c_bdw
 ```
 
 **与现有工作的本质区别**:
@@ -374,20 +409,40 @@ CPU Attention Cost:
 
 **关键公式**（恢复CGOPipe不变式的压缩级别求解）:
 ```
-Given: T_GPU_FFN = const
-Find: compression levels {q_k} for each turn k ≤ N such that:
-  Σ_k ctx_k × (16/q_k bits) × bandwidth_per_bit / c_bdw ≤ T_GPU_FFN
-  subject to: q_k ∈ {4, 8, 16}, q_N = 16 (最新轮不压缩)
-              quality_loss(q_k) ≤ ε_k (老轮次允许更大误差)
+Given: T_ctog = wc × expert_weight_bytes / ctog_bdw  (the real pipeline bottleneck)
+Find: compression levels {q_k bits} for each turn k ≤ N such that:
+  Σ_k (bls × ctx_k × BW_{qk}) / c_bdw ≤ T_ctog
+  subject to:
+    q_k ∈ {4, 8, 16}
+    q_N = 16    (最新轮不压缩，保证精度)
+    quality_loss(q_k) ≤ ε_k  (质量约束)
 
-Greedy solution: compress oldest turns first (maximize bits saved per quality impact)
+其中 quality_loss(q_k) 的定义:
+  - 度量方式: attention output的相对L2误差，
+    quality_loss(q) = ||Attn(Q, K_q, V_q) - Attn(Q, K_fp16, V_fp16)||_2 / ||Attn(Q, K_fp16, V_fp16)||_2
+  - 典型阈值 (参考KIVI/WKVQuant实验数值):
+    ε_k=1  (turn N-1, warm)  : 0.5%   → INT8通常满足
+    ε_k≤2  (turn N-2, cold)  : 2.0%   → INT4需要group quantization
+    ε_k≤3  (turn ≤N-3, very cold) : 5.0% → INT4 + 稀疏选取
+
+Greedy solution: compress oldest turns first (maximize bits_saved/quality_impact ratio)
 ```
 
-**量化收益** (理论):
-- ctx = 16K (约50轮 @300 tokens/turn):
-  - Without TASK: T_CPU = 16K × FP16_bw / c_bdw ≈ 5.5ms (>> T_GPU_FFN ≈ 0.15ms)
-  - With TASK (turns stratified): effective ctx × 0.25 bits_reduction ≈ 1.4ms → 接近T_GPU_FFN
-  - 可支持的有效context长度延伸 **4倍**
+**量化收益** (理论，生产配置 bs=324, T_ctog=0.154s):
+
+ctx=16K (约53轮 @300 tokens/turn) 时：
+```
+Without TASK (full FP16):
+  T_CPU_total = 324 × 16384 × 4096B / 76GB/s = 0.266s > T_ctog=0.154s  ✗ 不变式被违反
+
+With TASK (3-tier compression, turn N×2 + turn N-1×1 + ≤N-2×0.5 weight):
+  T_current_turn   = 324 × 300  × 4096B  / 76GB/s = 4.9ms
+  T_warm_turn      = 324 × 300  × 2048B  / 76GB/s = 2.4ms
+  T_cold_turns     = 324 × 15784× 1024B  / 76GB/s = 69.0ms
+  T_CPU_TASK = 4.9 + 2.4 + 69.0 = 76.3ms < T_ctog=154ms  ✓ 不变式恢复！
+```
+
+**结论**: TASK在16K ctx的生产配置下将CPU attention时间从0.266s降至0.076s，**恢复CGOPipe不变式**，相当于将有效支持的context延伸**约3.5倍**（从~9.5K延伸到~33K）。
 
 ---
 
