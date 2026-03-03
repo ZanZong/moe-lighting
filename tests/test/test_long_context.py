@@ -382,3 +382,106 @@ class TestOptimizerLongContextAnalysis(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Tests: long_context_challenges
+# ---------------------------------------------------------------------------
+
+class TestLongContextChallenges(unittest.TestCase):
+    """Tests for long_context_challenges module (no GPU required)."""
+
+    def setUp(self):
+        from fastmoe.backend.long_context_challenges import (
+            quantify_challenges,
+            simulate_multi_turn,
+            analyze_solution_cao,
+            analyze_solution_tkvp,
+            analyze_solution_hace,
+            analyze_solution_iskc,
+            analyze_solution_aro,
+            ChallengeMetrics,
+            TurnMetrics,
+            SolutionAnalysis,
+        )
+        self._qc   = quantify_challenges
+        self._smt  = simulate_multi_turn
+        self._cao  = analyze_solution_cao
+        self._tkvp = analyze_solution_tkvp
+        self._hace = analyze_solution_hace
+        self._iskc = analyze_solution_iskc
+        self._aro  = analyze_solution_aro
+        self._CM   = ChallengeMetrics
+        self._TM   = TurnMetrics
+        self._SA   = SolutionAnalysis
+        self.hw    = _make_hardware_config()
+        self.model = _FakeModelConfig()
+
+    def test_quantify_challenges_type(self):
+        m = self._qc(2048, 1, self.model, self.hw)
+        self.assertIsInstance(m, self._CM)
+        self.assertEqual(m.context_len, 2048)
+
+    def test_invariant_holds_short_context(self):
+        m = self._qc(512, 1, self.model, self.hw)
+        self.assertFalse(m.invariant_violated)
+        self.assertAlmostEqual(m.pipeline_efficiency, 1.0, places=2)
+
+    def test_invariant_violated_very_long_context(self):
+        # At 1M tokens, CPU attention must exceed GPU FFN
+        m = self._qc(1_000_000, 1, self.model, self.hw)
+        self.assertTrue(m.invariant_violated)
+        self.assertLess(m.pipeline_efficiency, 1.0)
+
+    def test_cpu_attn_grows_with_context(self):
+        m1 = self._qc(1024, 1, self.model, self.hw)
+        m2 = self._qc(8192, 1, self.model, self.hw)
+        self.assertLess(m1.t_cpu_attn_ms, m2.t_cpu_attn_ms)
+
+    def test_redundant_compute_grows_with_turns(self):
+        m1 = self._qc(1024, 1, self.model, self.hw, turn_tokens=100)
+        m2 = self._qc(4096, 1, self.model, self.hw, turn_tokens=100)
+        self.assertLess(m1.redundant_compute_fraction,
+                        m2.redundant_compute_fraction)
+
+    def test_kv_bytes_positive(self):
+        m = self._qc(2048, 2, self.model, self.hw)
+        self.assertGreater(m.kv_cpu_bytes, 0)
+
+    def test_simulate_multi_turn_length(self):
+        turns = self._smt(512, 100, 50, 10, 1, self.model, self.hw)
+        self.assertEqual(len(turns), 10)
+
+    def test_simulate_multi_turn_context_grows(self):
+        turns = self._smt(512, 100, 50, 5, 1, self.model, self.hw)
+        ctxs = [t.context_len for t in turns]
+        self.assertEqual(ctxs, sorted(ctxs))
+
+    def test_simulate_redundant_pct_grows(self):
+        turns = self._smt(512, 100, 50, 5, 1, self.model, self.hw)
+        pcts = [t.redundant_compute_pct for t in turns]
+        self.assertTrue(all(pcts[i] <= pcts[i+1] for i in range(len(pcts)-1)))
+
+    def test_solution_cao_type(self):
+        s = self._cao(2048, 1, self.model, self.hw)
+        self.assertIsInstance(s, self._SA)
+        self.assertGreater(s.speedup, 0)
+
+    def test_solution_tkvp_faster_than_baseline(self):
+        # With half the context already cached, TKVP should reduce prefill time
+        s = self._tkvp(4096, 2048, 1, self.model, self.hw)
+        self.assertGreater(s.speedup, 1.0)
+
+    def test_solution_iskc_int4_faster_than_int8(self):
+        s8 = self._iskc(16384, 8, 1, self.model, self.hw)
+        s4 = self._iskc(16384, 4, 1, self.model, self.hw)
+        # INT4 has more bandwidth reduction, so should be >= INT8 speedup
+        self.assertGreaterEqual(s4.speedup, s8.speedup)
+
+    def test_solution_hace_positive_speedup(self):
+        s = self._hace(16384, 2048, 512, 1, self.model, self.hw)
+        self.assertGreater(s.speedup, 0)
+
+    def test_solution_aro_type(self):
+        s = self._aro(512, 4096, 1, self.model, self.hw)
+        self.assertIsInstance(s, self._SA)
